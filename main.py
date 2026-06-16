@@ -1,127 +1,152 @@
 from __future__ import annotations
 
+import csv
+import shelve
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING
 from typing import Literal
 
-
-Action = Literal["Buy", "Sell", "Split"]
-
-
-@dataclass
-class Transaction:
-    date: str                 # "2025-10-17"
-    action: Action            # "Buy", "Sell", or "Split"
-    quantity: Decimal         # shares bought/sold; for split, use multiplier numerator
-    net_amount: Decimal       # trade cash amount in original currency, including fees
-    fx: Decimal = Decimal("1")  # currency -> JPY rate; use 1 if already JPY
-    note: str = ""
+import typer
 
 
-@dataclass
-class LotState:
+type Action = Literal["Buy", "Sell", "Split"]
+
+
+@dataclass(frozen=True)
+class State:
     shares: Decimal = Decimal("0")
-    basis_jpy: Decimal = Decimal("0")  # total remaining acquisition cost
+    unit_basis_jpy: Decimal = Decimal("0")  # rounded-up yen/share
 
     @property
-    def avg_basis_per_share(self) -> Decimal:
-        if self.shares == 0:
-            return Decimal("0")
-        return self.basis_jpy / self.shares
+    def total_basis_jpy(self) -> Decimal:
+        return self.shares * self.unit_basis_jpy
+
+    def __str__(self):
+        return f"<S {self.shares} shares {self.unit_basis_jpy} b/sh {self.total_basis_jpy} basis>"
 
 
-def yen(x: Decimal) -> Decimal:
-    return x.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+def coerce(x: str | int | float) -> Decimal:
+    return Decimal(str(x).replace(",", ""))
 
 
-def process_transactions(transactions: list[Transaction]) -> list[dict]:
-    txs = sorted(transactions, key=lambda t: datetime.fromisoformat(t.date))
-    state = LotState()
-    rows = []
+def ceil_yen(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("1"), rounding=ROUND_CEILING)
 
+
+def transact(
+    state: State,
+    date: str,
+    action: Action,
+    quantity: str | int | float,
+    net_amount_ccy: str | int | float = "0",
+    fx_to_jpy: str | int | float = "1",
+    note: str = "",
+) -> State:
+    q = coerce(quantity)
+    net = coerce(net_amount_ccy)
+    fx = coerce(fx_to_jpy)
+    amount_jpy = net * fx
+
+    #print(f"\n{date} {action.upper()} {q} {note}")
+
+    if action == "Buy":
+        if q <= 0:
+            raise ValueError("Buy quantity must be positive")
+
+        new_shares = state.shares + q
+        new_total_basis = state.total_basis_jpy + amount_jpy
+        new_unit_basis = ceil_yen(new_total_basis / new_shares)
+
+        new_state = State(new_shares, new_unit_basis)
+
+        print(f"  Buy cost: {ceil_yen(amount_jpy)} JPY")
+        return new_state
+
+    if action == "Sell":
+        if q <= 0:
+            raise ValueError("Sell quantity must be positive")
+        if q > state.shares:
+            raise ValueError(f"selling {q}, but only have {state.shares}")
+
+        proceeds_jpy = amount_jpy
+        basis_sold_jpy = state.unit_basis_jpy * q
+        gain_jpy = proceeds_jpy - basis_sold_jpy
+
+        new_shares = state.shares - q
+        new_state = State() if new_shares == 0 else State(new_shares, state.unit_basis_jpy)
+
+        print(f"  proceeds:   {ceil_yen(proceeds_jpy)} JPY")
+        print(f"  basis sold: {basis_sold_jpy} JPY")
+        print(f"  gain/loss:  {ceil_yen(gain_jpy)} JPY")
+        return new_state
+
+    if action == "Split":
+        if q <= 0:
+            raise ValueError("Split multiplier must be positive")
+
+        new_state = State(
+            shares=state.shares * q,
+            unit_basis_jpy=ceil_yen(state.unit_basis_jpy / q),
+        )
+
+        print(f"  Split multiplier: {q}")
+        return new_state
+
+    raise ValueError(f"unknown action: {action}")
+
+
+def main(filename: str, stock: str, mode: Literal["CDP", "SRS"] = "CDP"):
+    with shelve.open('rates.db') as db:
+        if not db:
+            data = csv.reader(open("Mizuho fx quote.csv"))
+            head = next(data)
+            currency_index = {tag: i for i, tag in enumerate(head)}
+            currencies = {tag: {} for tag in "EUR USD SGD".split()}
+            for row in data:
+                bits = ["%02d" % i for i in map(int, row[0].split("/"))]
+                date = "-".join(bits)
+                for c in currencies:
+                    currencies[c][date] = row[currency_index[c]]
+            db.update(currencies)
+
+        with open(filename) as raw:
+            def parser():
+                timestamp = next(raw).strip()
+                print("raw file", timestamp)
+                _head = next(raw).strip()
+                # [(0, 'Date'),
+                # (1, 'Account'), (2, 'Code'), (3, 'Name'), (4, 'Action'),
+                # (5, 'Quantity'), (6, 'Price'), (7, 'Nett amount'), (8, 'Contract/Reference')]
+                while True:
+                    try:
+                        main = next(raw).strip()
+                        if not main.startswith('"'):
+                            continue
+                        tail = next(raw).strip()
+                        yield f"{main}{tail}"
+                    except StopIteration:
+                        return
+
+            data = csv.reader(parser())
+            txs = []
+            for row in data:
+                d,m,y = map(int, row[0].split("/"))
+                date = f"{y}-{m:02d}-{d:02d}"
+                if mode != row[1]:
+                    continue
+                if stock != row[2]:
+                    continue
+                txs.append(dict(date=date, action=row[4], quantity=row[5],
+                                net_amount_ccy=row[7], fx_to_jpy=db[row[17]][date]))
+            txs.sort(key=lambda d: d["date"])
+
+    s = State()
     for tx in txs:
-        before_shares = state.shares
-        before_basis = state.basis_jpy
-        before_avg = state.avg_basis_per_share
-
-        realized_gain = None
-        proceeds_jpy = None
-        basis_sold_jpy = None
-
-        if tx.action == "Buy":
-            # net_amount should be positive cash paid, including fees
-            cost_jpy = tx.net_amount * tx.fx
-            state.shares += tx.quantity
-            state.basis_jpy += cost_jpy
-
-        elif tx.action == "Sell":
-            # net_amount should be positive cash received, after fees
-            if tx.quantity > state.shares:
-                raise ValueError(
-                    f"{tx.date}: selling {tx.quantity} but only have {state.shares}"
-                )
-
-            proceeds_jpy = tx.net_amount * tx.fx
-            basis_sold_jpy = before_avg * tx.quantity
-            realized_gain = proceeds_jpy - basis_sold_jpy
-
-            state.shares -= tx.quantity
-            state.basis_jpy -= basis_sold_jpy
-
-            # avoid tiny residue from Decimal division
-            if state.shares == 0:
-                state.basis_jpy = Decimal("0")
-
-        elif tx.action == "Split":
-            # Example: 10-for-1 split: quantity=10, net_amount=0
-            # Total basis unchanged; shares multiplied.
-            if tx.quantity <= 0:
-                raise ValueError(f"{tx.date}: split multiplier must be positive")
-            state.shares *= tx.quantity
-
-        else:
-            raise ValueError(f"Unknown action: {tx.action}")
-
-        rows.append({
-            "date": tx.date,
-            "action": tx.action,
-            "quantity": tx.quantity,
-            "net_amount": tx.net_amount,
-            "fx": tx.fx,
-            "before_shares": before_shares,
-            "before_basis_jpy": yen(before_basis),
-            "before_avg_jpy": before_avg,
-            "proceeds_jpy": yen(proceeds_jpy) if proceeds_jpy is not None else None,
-            "basis_sold_jpy": yen(basis_sold_jpy) if basis_sold_jpy is not None else None,
-            "realized_gain_jpy": yen(realized_gain) if realized_gain is not None else None,
-            "after_shares": state.shares,
-            "after_basis_jpy": yen(state.basis_jpy),
-            "after_avg_jpy": state.avg_basis_per_share,
-            "note": tx.note,
-        })
-
-    return rows
-
-
-def main():
-    transactions = [
-        Transaction("2018-01-10", "Buy",  Decimal("5900"),  Decimal("9945.42")),
-        Transaction("2018-10-01", "Buy",  Decimal("10000"), Decimal("16154.28")),
-        Transaction("2020-11-06", "Buy",  Decimal("2200"),  Decimal("4230.93")),
-        Transaction("2025-10-17", "Sell", Decimal("18000"), Decimal("25830.63")),
-    ]
-
-    rows = process_transactions(transactions)
-
-    for row in rows:
-        print(row)
-
-    last = rows[-1]
-    print("End shares:", last["after_shares"])
-    print("End basis:", last["after_basis_jpy"])
-    print("Avg basis/share:", last["after_avg_jpy"])
+        print(tx)
+        s = transact(s, **tx)
+        print(s)
+        print()
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)
