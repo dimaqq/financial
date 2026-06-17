@@ -38,13 +38,13 @@ def transact(
     date: str,
     action: Action,
     quantity: str | int | float,
-    net_amount_ccy: str | int | float = "0",
-    fx_to_jpy: str | int | float = "1",
+    net_amount: str | int | float = "0",
+    fx_rate: str | int | float = "1",
     note: str = "",
 ) -> State:
     q = coerce(quantity)
-    net = coerce(net_amount_ccy)
-    fx = coerce(fx_to_jpy)
+    net = coerce(net_amount)
+    fx = coerce(fx_rate)
     amount_jpy = net * fx
 
     #print(f"\n{date} {action.upper()} {q} {note}")
@@ -95,7 +95,7 @@ def transact(
     raise ValueError(f"unknown action: {action}")
 
 
-def main(filename: str, stock: str, mode: Literal["CDP", "SRS"] = "CDP"):
+def main(filename: str, stock: str, mode: Literal["Cash", "CDP", "SRS"] = "Cash"):
     with shelve.open('rates.db') as db:
         if not db:
             data = csv.reader(open("Mizuho fx quote.csv"))
@@ -136,8 +136,30 @@ def main(filename: str, stock: str, mode: Literal["CDP", "SRS"] = "CDP"):
                     continue
                 if stock != row[2]:
                     continue
-                txs.append(dict(date=date, action=row[4], quantity=row[5],
-                                net_amount_ccy=row[7], fx_to_jpy=db[row[17]][date]))
+                action = row[4]
+                # FIXME parse split actions by:
+                # Stock Split (Debit) <N>:1
+                if action in ("Buy", "Sell"):
+                    quantity = row[5]
+                    net_amount=row[7]
+                    fx_rate=db[row[18]][date]
+                elif action.startswith("Stock Split (Debit) "):
+                    quantity, den = map(int, action.split()[3].split(":"))
+                    assert den == 1
+                    action = "Split"
+                    net_amount = 0
+                    fx_rate = 0
+                elif action == "Stock Split (Credit)":
+                    continue
+                elif action.startswith("Avg cost price adjustment"):
+                    continue
+                elif action.startswith("Cash Dividend"):
+                    continue
+                else:
+                    raise ValueError(f"bad {action=}")
+                txs.append(dict(date=date, action=action, quantity=quantity,
+                                net_amount=net_amount, fx_rate=fx_rate))
+
             txs.sort(key=lambda d: d["date"])
 
     s = State()
